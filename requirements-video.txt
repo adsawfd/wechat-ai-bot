@@ -1,0 +1,2 @@
+# Offline CPU speech recognition for video dialogue. No CUDA dependency.
+faster-whisper==1.2.1

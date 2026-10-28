@@ -1,0 +1,6 @@
+# Optional native WeChat voice-message support; install into the existing venv.
+pycaw==20260927
+sounddevice==0.5.5
+numpy
+pywin32
+edge-tts==7.3.1

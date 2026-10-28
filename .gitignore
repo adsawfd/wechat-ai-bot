@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+*.env
+!.env.example
+称呼配置.json
+.models/
+*.log
+found_images/
+reaction_cards/
+singing_previews/
+wechatauto_logs/
+backups/
