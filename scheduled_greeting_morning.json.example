@@ -1,0 +1,10 @@
+{
+  "id": "morning-greeting",
+  "account_id": "YOUR_BOT_ACCOUNT_ID",
+  "group_id": "YOUR_GROUP_ID@chatroom",
+  "member_id": "MEMBER_ACCOUNT_ID",
+  "member_group_name": "群昵称甲",
+  "text": "早上好",
+  "hour": 8,
+  "minute": 0
+}

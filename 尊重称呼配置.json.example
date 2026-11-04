@@ -1,0 +1,6 @@
+{
+  "account_id": "YOUR_BOT_ACCOUNT_ID",
+  "contacts": [
+    {"username": "MEMBER_ACCOUNT_ID", "title": "友好称呼"}
+  ]
+}

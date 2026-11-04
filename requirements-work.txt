@@ -1,0 +1,5 @@
+python-docx==1.2.0
+openpyxl==3.1.5
+pyautogui==0.9.54
+uiautomation==2.0.29
+pywin32==312

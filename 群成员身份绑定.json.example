@@ -1,0 +1,13 @@
+{
+  "account_id": "YOUR_BOT_ACCOUNT_ID",
+  "group_id": "YOUR_GROUP_ID@chatroom",
+  "people": [
+    {
+      "member_id": "MEMBER_ACCOUNT_ID",
+      "group_nickname": "群昵称甲",
+      "profile_nickname_at_binding": "微信昵称甲",
+      "real_name": "示例姓名",
+      "title": "友好称呼"
+    }
+  ]
+}

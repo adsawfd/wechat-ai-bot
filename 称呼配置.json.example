@@ -1,0 +1,6 @@
+{
+  "account_id": "YOUR_BOT_ACCOUNT_ID",
+  "boss_contacts": [
+    {"username": "OWNER_ACCOUNT_ID", "label": "管理员甲"}
+  ]
+}

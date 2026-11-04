@@ -1,3 +1,5 @@
 wechatauto-replica==1.2.8.1
 openai==3.37.0
 python-dotenv==1.2.4
+psutil==7.2.2
+Pillow==13.0.0
