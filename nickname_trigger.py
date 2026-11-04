@@ -54,6 +54,7 @@ class NicknameTrigger:
             text = normalized(content)
             if not self.name:
                 return None
-            hinted = any(alias in text for alias in self.aliases)
+            hinted = any((bool(re.search(r'(?<![大小])'+re.escape(alias),text))
+                          if alias in ('肥鱼','胖鱼') else alias in text) for alias in self.aliases)
             hinted = hinted or bool(re.search(r'机器人|助手|人工智能|(?<![a-z])ai(?![a-z])|你.*(?:开发|模型|版本|联网|程序)', text))
             return {'nickname': self.name, 'aliases': list(self.aliases)} if hinted else None

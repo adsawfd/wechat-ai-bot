@@ -15,12 +15,12 @@ STICKER_STYLE = '''
 '''
 
 
-def generate_sticker_reply(client, model, style, previous, user_text, *, images):
+def generate_sticker_reply(client, model, style, previous, user_text, *, images, respect_style=''):
     if not images:
         return None
     response = client.chat.completions.create(
         model=model,
-        messages=[{'role': 'system', 'content': style + STICKER_STYLE},
+        messages=[{'role': 'system', 'content': style + STICKER_STYLE + respect_style},
                   *previous,
                   {'role': 'user', 'content': [{'type': 'text', 'text': user_text}, *images]}],
         response_format={'type': 'json_object'}, max_tokens=300,

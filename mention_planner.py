@@ -91,17 +91,20 @@ request_status只是本机匹配到的名字情况，不代表当前一定是在
             return clean,None,error
 
 
-def build_mention_roster(db,chat_id,sender_id,self_id,text,*,at_ids=(),recent_ids=(),allow_openers=True):
+def build_mention_roster(db,chat_id,sender_id,self_id,text,*,at_ids=(),recent_ids=(),allow_openers=True,group_aliases=None):
     if db is None or not chat_id.endswith('@chatroom'):
         return None
     try:
         members=db.get_group_members(chat_id)
         if not isinstance(members,list):
             return None
+        def extra_aliases(item):
+            value=(group_aliases or {}).get(item.get('username'))
+            return value if isinstance(value,(list,tuple)) else ([value] if value else [])
         owners={}
         for item in members:
-            for field in ('remark','nick_name'):
-                key=_norm(item.get(field))
+            for value in [item.get('remark'),item.get('nick_name'),*extra_aliases(item)]:
+                key=_norm(value)
                 if key:
                     owners.setdefault(key,set()).add(item.get('username'))
         clean=unquoted(text)
@@ -113,7 +116,7 @@ def build_mention_roster(db,chat_id,sender_id,self_id,text,*,at_ids=(),recent_id
             who=item.get('username')
             if not who or who==self_id or who=='notify@all':
                 continue
-            aliases=[str(item.get(f) or '').strip() for f in ('remark','nick_name')]
+            aliases=[str(v or '').strip() for v in (item.get('remark'),item.get('nick_name'),*extra_aliases(item))]
             aliases=list(dict.fromkeys(a for a in aliases if a and _norm(a) not in RESERVED))
             named=any(_norm(alias) in _norm(clean) for alias in aliases)
             if named or who in native:

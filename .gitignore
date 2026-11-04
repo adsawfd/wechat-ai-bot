@@ -5,8 +5,15 @@ __pycache__/
 *.env
 !.env.example
 称呼配置.json
+尊重称呼配置.json
+群成员身份绑定.json
+scheduled_greeting*.json
+scheduled_greeting_state.*
+*.sqlite3*
+*.staged
 .models/
 *.log
+工作任务/
 found_images/
 reaction_cards/
 singing_previews/

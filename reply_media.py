@@ -7,7 +7,7 @@ KINDS = {'得意', '大笑', '捂脸', '生气', '疑惑', '点赞'}
 MEDIA_STYLE = '''
 日常聊天默认用纯文字，不需要每句都加emoji或微信表情。
 只有表情能明显传达当下语气时，才偶尔选择文字加表情或单独emoji；不要连续几次使用表情，每次最多一个。
-文字表情可用少量常见微信代码[捂脸]、[偷笑]、[笑哭]、[旺柴]、[机智]，或😂😏🙄👍等emoji。
+需要表情时直接使用 Unicode emoji，例如😂😏🙄👍，不要输出 [doge] 或 [捂脸] 这种方括号代码。
 严肃问题、事实解释和安慰优先用纯文字；很短的玩笑反应才可只回一个emoji。
 适合玩笑互动、想表达强烈反应或对方索要表情包时，可改为只输出一条：
 [[表情包:情绪|短句]]
@@ -64,10 +64,24 @@ def render_card(kind, caption, output_dir=None):
     return path
 
 
+_FACE_EMOJI = {
+    'doge': '🐶', '旺柴': '🐶', '捂脸': '🤦', '偷笑': '🤭',
+    '笑哭': '😂', '机智': '😏', '微笑': '🙂', '得意': '😎',
+    '白眼': '🙄', '大哭': '😭', '流泪': '😢', '发怒': '😠',
+    '疑问': '🤔', '鼓掌': '👏', '点赞': '👍', '爱心': '❤️',
+    '裂开': '😵', '吃瓜': '🍉', '奸笑': '😏', '尴尬': '😅',
+}
+_FACE_CODE = re.compile(r'\[([^\[\]\n]{1,12})\]')
+
+
+def normalize_face_codes(text):
+    return _FACE_CODE.sub(lambda match: _FACE_EMOJI.get(match.group(1).lower(), match.group(0)), text)
+
+
 def prepare_reply(answer, output_dir=None):
     match = re.fullmatch(r'\s*\[\[表情包:([^|\]\n]+)\|([^\]\n]+)\]\]\s*', answer)
     if not match:
-        return answer, None
+        return normalize_face_codes(answer), None
     kind, caption = match.group(1).strip(), match.group(2).strip()[:16]
     if kind not in KINDS or not caption:
         return caption or '😂', None

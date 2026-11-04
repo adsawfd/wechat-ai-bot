@@ -4,14 +4,16 @@ import html
 import re
 from collections import defaultdict, deque
 from threading import Lock
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
+load_dotenv()
 from openai import OpenAI
 from chat_search import generate_answer
 from chat_persona import BASE_STYLE, PRIVATE_STYLE, GROUP_STYLE, generate_pat_reply
 from pat_events import get_pat_sender
 from group_mentions import send_group_reply, send_image_reply, send_group_mention
-from mention_planner import build_mention_roster, strip_mention_control, has_mention_request
+from mention_planner import build_mention_roster, strip_mention_control, has_mention_request, MentionPlan
 from bot_runtime import configure_runtime, attach_gui
 from bot_account import open_bound_database
 from reply_media import prepare_reply, MEDIA_STYLE
@@ -24,6 +26,15 @@ from group_engagement import GroupEngagement, delivery_succeeded
 from proactive_pats import ProactivePats, PAT_STYLE, extract_pat_intent
 from native_pat import send_native_pat
 from reply_identity import ReplyIdentity
+from remote_computer import unique_private_target
+from work_assistant import WorkAssistant
+from respectful_contact import RespectfulContacts
+from learned_preferences import LearnedPreferences
+from group_identity_context import referenced_member_context
+from group_profiles import GroupProfiles
+from identity_learning import IdentityMemory
+from group_silence import GroupSilence
+from token_usage import TokenUsage, MeteredClient, UsageQueries
 from voice_audio import spoken_text
 from voice_director import VoiceDirector
 from singing import singing_available, singing_note, send_singing_reply
@@ -77,6 +88,10 @@ self_id = wx._db.get_self_info().get("username")
 if not self_id:
     raise RuntimeError("无法确认当前微信账号身份")
 
+usage_ledger = TokenUsage(self_id)
+ai = MeteredClient(ai, usage_ledger)
+usage_queries = UsageQueries(ai, MODEL)
+
 nickname_trigger = NicknameTrigger(wx._db, self_id)
 incoming_images = IncomingImages(wx._db)
 incoming_videos = IncomingVideos(wx._db, opener=ensure_video_cached)
@@ -89,10 +104,20 @@ seen_order = deque()
 lock = Lock()
 # 每个群成员独立进入接话状态；/结束 或重启后退出。
 group_followups = {}
-group_engagement = GroupEngagement()
+group_probability = float(os.getenv('GROUP_REPLY_PROBABILITY', '0.60'))
+if not 0 <= group_probability <= 1:
+    raise RuntimeError('GROUP_REPLY_PROBABILITY 必须在 0 和 1 之间')
+group_engagement = GroupEngagement(probability=group_probability)
 proactive_pats = ProactivePats(enabled=os.getenv('ENABLE_PROACTIVE_PAT', '1') == '1')
 voice_director = VoiceDirector(gender=os.getenv('VOICE_GENDER', 'male'))
 reply_identity = ReplyIdentity.load(self_id)
+group_silence = GroupSilence(self_id, reply_identity.boss_ids)
+COMPUTER_CONTROL = os.getenv('ENABLE_COMPUTER_CONTROL', '0') == '1'
+remote_computer = WorkAssistant(ai, MODEL, reply_identity.boss_ids, AUTO_SEND and COMPUTER_CONTROL)
+respectful_contacts = RespectfulContacts.load(self_id)
+group_profiles = GroupProfiles.load(self_id)
+identity_memory = IdentityMemory(self_id, reply_identity.boss_ids)
+learned_preferences = LearnedPreferences(self_id, reply_identity.boss_ids)
 
 
 # 聊天风格与拍一拍动态回复在 chat_persona.py 中统一配置。
@@ -209,6 +234,18 @@ def is_really_at_me(msg, chat):
     return self_id in at_ids
 
 
+@contextmanager
+def group_delivery(chat_id, token=None):
+    if not str(chat_id).endswith('@chatroom'):
+        yield True
+        return
+    from wechatauto.utils import LockManager
+    # Consistent lock order with scheduled sends prevents deadlocks.
+    with LockManager.acquire():
+        with group_silence.delivery(chat_id, token) as allowed:
+            yield allowed
+
+
 # ===== 接收消息 =====
 def on_message(msg, chat):
     # AddListenAll also reports our own sends, including messages entered in the
@@ -254,6 +291,9 @@ def on_message(msg, chat):
     )
     is_group = chat_id.endswith("@chatroom")
 
+    if not is_group and PRIVATE_MODE == 'test' and chat_name != TEST_FRIEND:
+        return
+
     # 跳过文件传输助手和公众号
     if chat_id == "filehelper" or chat_id.startswith("gh_"):
         return
@@ -296,6 +336,125 @@ def on_message(msg, chat):
         print("缺少消息编号，安全跳过", flush=True)
         return
     message_key = (chat_id, seq, local_id)
+    group_reply_token = None
+    if is_group:
+        if GROUPS and chat_name not in GROUPS:
+            return
+        command = None
+        if not (is_pat or is_image or is_video or is_emoji or is_quote):
+            if reply_identity.is_boss(sender_id):
+                nickname_trigger.matches('')
+            names = (getattr(nickname_trigger, 'name', ''), *getattr(nickname_trigger, 'aliases', ()))
+            command = group_silence.control(chat_id, sender_id, content, seq, names=names)
+        if command is not None:
+            if command['action'] == 'mute':
+                with lock:
+                    for key in list(group_followups):
+                        if isinstance(key, tuple) and key[0] == chat_id:
+                            group_followups.pop(key, None)
+                            histories.pop(key, None)
+            if command['ack'] and AUTO_SEND:
+                # The single acknowledgment intentionally bypasses the mute gate.
+                from wechatauto.utils import LockManager
+                with LockManager.acquire():
+                    print('群聊静音控制确认：', send_group_reply(chat, '收到', sender_id, wx._db), flush=True)
+            return
+        if group_silence.muted(chat_id):
+            return
+        group_reply_token = group_silence.token(chat_id)
+        if group_reply_token is None:
+            return
+    if not (is_pat or is_image or is_video or is_emoji or is_quote) and usage_queries.matches(content, chat_id):
+        with lock:
+            if message_key in seen:
+                return
+            seen.add(message_key)
+            seen_order.append(message_key)
+            if len(seen_order) > 2000:
+                seen.discard(seen_order.popleft())
+        report = usage_ledger.report()
+        report_text = ('好的老板，' if reply_identity.is_boss(sender_id) else '') + report
+        report_text = respectful_contacts.address(report_text, sender_id)
+        if AUTO_SEND:
+            with group_delivery(chat_id, group_reply_token) as allowed:
+                if not allowed:
+                    return
+                if is_group:
+                    result = send_group_reply(chat, report_text, sender_id, wx._db)
+                else:
+                    from group_mentions import _plain_reply
+                    if not unique_private_target(wx._db, chat_id):
+                        print('无法唯一确认用量报告接收人，未发送',flush=True)
+                        return
+                    result = _plain_reply(chat, report_text)
+                if delivery_succeeded(result):
+                    usage_queries.remember(chat_id)
+                print('token用量报告已尝试发送',flush=True)
+        else:
+            print('token用量报告预览：'+report,flush=True)
+        return
+
+    learning_result = None
+    if (not is_group and not (is_pat or is_image or is_video or is_emoji or is_quote)
+            and (PRIVATE_MODE != 'test' or chat_name == TEST_FRIEND)):
+        with lock:
+            if message_key in seen:
+                return
+        learning_result = learned_preferences.teach(ai, MODEL, chat_id, sender_id, content)
+    computer_task = remote_computer.route(sender_id, content) if COMPUTER_CONTROL and not learning_result and not is_group and not is_quote and isinstance(msg, FriendTextMessage) else None
+    if computer_task is not None:
+        if not remote_computer.eligible(msg, chat_id, sender_id, content, isinstance(msg, FriendTextMessage) and not is_quote):
+            print('工作指令未通过权限或新鲜度校验', flush=True)
+            return
+        if computer_task == '__STOP__':
+            remote_computer.stop(sender_id)
+            print('已请求停止工作任务', flush=True)
+            return
+        def do_work():
+            try:
+                if not remote_computer.claim(chat_id, msg): return
+                if not unique_private_target(wx._db, chat_id):
+                    print('无法唯一确认工作任务私聊对象', flush=True)
+                    return
+                from wechatauto.utils import LockManager
+                from group_mentions import _plain_reply, _display_name, _ready_input
+                with LockManager.acquire():
+                    if remote_computer.cancel.is_set(): return
+                    _plain_reply(chat,'好的老板，开始处理这项工作。')
+                    try:
+                        outcome, files = remote_computer.work(sender_id, computer_task)
+                    except Exception as exc:
+                        outcome, files = '工作任务暂停：' + type(exc).__name__, []
+                    if remote_computer.cancel.is_set(): outcome, files = '已停止工作任务。', []
+                    active_chat=chat.chat
+                    gui=getattr(active_chat,'_gui',None)
+                    if not isinstance(getattr(gui,'main_hwnd',None),int):
+                        print('无法确认私聊窗口，未发送工作结果',flush=True)
+                        return
+                    statuses=[]
+                    for path in files:
+                        if remote_computer.cancel.is_set(): break
+                        if not unique_private_target(wx._db,chat_id):
+                            statuses.append('无法确认接收人，文件未发送');break
+                        _, control = _ready_input(chat,gui)
+                        if control is None:
+                            statuses.append('无法确认输入框，文件未发送');break
+                        # One send attempt only; never retry uncertain submissions.
+                        try:
+                            result=active_chat.SendFiles(str(path),who=_display_name(chat),exact=True)
+                            ok=delivery_succeeded(result)
+                            statuses.append(path.name + ('：接口报告发送成功' if ok else '：发送结果未确认，未重试'))
+                        except Exception:
+                            statuses.append(path.name+'：发送结果未确认，未重试')
+                    if statuses: outcome += '\n'+'\n'.join(statuses)
+                    result=_plain_reply(chat,'好的老板，'+outcome)
+                    print('工作任务结果已尝试回复',flush=True)
+            except Exception as exc:
+                print('工作任务失败：',type(exc).__name__,flush=True)
+        status=remote_computer.submit(sender_id,do_work)
+        print('工作任务队列：'+status,flush=True)
+        return
+
     boss_ack_hint = (not (is_pat or is_image or is_video or is_emoji)
                      and reply_identity.is_boss(sender_id) and reply_identity.explicit_request(content))
     with lock:
@@ -307,6 +466,10 @@ def on_message(msg, chat):
     called_by_name = False
     engagement_mode = None
     mention_roster = None
+    identity_question = False
+    identity_target = None
+    identity_answer = None
+    identity_members = None
     history_key = (chat_id, sender_id) if is_group else chat_id
 
     # ===== 场景识别 =====
@@ -340,6 +503,13 @@ def on_message(msg, chat):
             if not group_engagement.observe(chat_id, sender_id, observed_text, message_key,
                                             addressed_to_others=bool(at_ids and not direct_at_me)):
                 return
+            if not (is_quote or is_image or is_video or is_emoji) and wx._db is not None:
+                try:
+                    identity_members = wx._db.get_group_members(chat_id)
+                    if not group_engagement.is_paused(chat_id,sender_id):
+                        identity_memory.remember_pending(chat_id,sender_id,content,at_ids,identity_members,self_id,group_profiles)
+                except Exception as exc:
+                    print('身份上下文读取失败：',type(exc).__name__,flush=True)
             proactive_pats.observe(chat_id, sender_id, content, message_key)
             with lock:
                 continuing = history_key in group_followups
@@ -357,16 +527,45 @@ def on_message(msg, chat):
                 group_engagement.pause(chat_id, sender_id)
                 print("已停止这位群成员的接话，重新 @ 或叫昵称可恢复", flush=True)
                 if reply_identity.is_boss(sender_id) and AUTO_SEND:
-                    print('停止接话回应：',send_group_reply(chat,'好的老板，已停止接话。',sender_id,wx._db),flush=True)
+                    with group_delivery(chat_id, group_reply_token) as allowed:
+                        if allowed:
+                            print('停止接话回应：',send_group_reply(chat,'好的老板，已停止接话。',sender_id,wx._db),flush=True)
                 return
             if direct_at_me or called_by_name or quoting_me:
                 group_engagement.resume(chat_id, sender_id)
+            if (group_profiles.applies(chat_id) and not is_quote and not (is_image or is_video or is_emoji)
+                    and not group_engagement.is_paused(chat_id, sender_id)):
+                try:
+                    identity_question, identity_target = group_profiles.identity_question(
+                        chat_id, content, at_ids, identity_members, self_id)
+                except Exception as exc:
+                    print('群成员身份问题判断失败：', type(exc).__name__, flush=True)
+            if (not is_quote and not (is_image or is_video or is_emoji)
+                    and not group_engagement.is_paused(chat_id,sender_id) and isinstance(identity_members,list)):
+                learned_q,learned_target,learned_name = identity_memory.question(
+                    chat_id,content,at_ids,identity_members,self_id,group_profiles)
+                if learned_q:
+                    if identity_question and identity_target != learned_target and not (learned_target and learned_target in at_ids):
+                        identity_question,identity_target,identity_answer = True,None,None
+                    else:
+                        identity_question,identity_target,identity_answer = True,learned_target,learned_name
+                names=(getattr(nickname_trigger,'name',''), *getattr(nickname_trigger,'aliases',()))
+                pending_q,pending_target,pending_name=identity_memory.take_pending(
+                    chat_id,sender_id,content,at_ids,identity_members,self_id,names)
+                if pending_q:
+                    identity_question,identity_target,identity_answer=True,pending_target,pending_name
             if not direct_at_me and not called_by_name and not quoting_me and not continuing and not is_emoji:
                 if is_image or is_video:
                     return
                 identity_hint = nickname_trigger.reference_hint(content)
-                engagement_mode = group_engagement.decide(ai, MODEL, chat_id, sender_id, content, identity=identity_hint, quoted=is_quote,
-                    allow_pat=proactive_pats.can_consider(chat_id, sender_id, content, message_key))
+                if identity_question:
+                    engagement_mode = 'context'
+                elif (respectful_contacts.style_for(sender_id) and not is_quote
+                        and group_engagement.follows_recent_bot(chat_id, sender_id)):
+                    engagement_mode = 'context'
+                else:
+                    engagement_mode = group_engagement.decide(ai, MODEL, chat_id, sender_id, content, identity=identity_hint, quoted=is_quote,
+                        allow_pat=proactive_pats.can_consider(chat_id, sender_id, content, message_key))
                 if not engagement_mode:
                     return
                 if engagement_mode == 'ambient_pat':
@@ -382,16 +581,19 @@ def on_message(msg, chat):
                     if not AUTO_SEND:
                         print('群聊氛围适合拍一拍，预览模式未执行', flush=True)
                     elif proactive_pats.choose(chat_id, sender_id, content, message_key, suggested=True):
-                        if boss_ack_hint:
-                            ack_result=send_group_reply(chat,'好的老板',sender_id,wx._db)
-                            print('指令回应：',ack_result,flush=True)
-                            if not delivery_succeeded(ack_result):
+                        with group_delivery(chat_id, group_reply_token) as allowed:
+                            if not allowed:
                                 return
-                        print('根据群聊氛围主动拍一拍：', chat_name, flush=True)
-                        pat_result = send_native_pat(chat, msg, sender_id, wx._db, self_id)
-                        print('主动拍一拍结果：', pat_result, flush=True)
-                        if delivery_succeeded(pat_result):
-                            group_engagement.record_pat(chat_id, sender_id)
+                            if boss_ack_hint:
+                                ack_result=send_group_reply(chat,'好的老板',sender_id,wx._db)
+                                print('指令回应：',ack_result,flush=True)
+                                if not delivery_succeeded(ack_result):
+                                    return
+                            print('根据群聊氛围主动拍一拍：', chat_name, flush=True)
+                            pat_result = send_native_pat(chat, msg, sender_id, wx._db, self_id)
+                            print('主动拍一拍结果：', pat_result, flush=True)
+                            if delivery_succeeded(pat_result):
+                                group_engagement.record_pat(chat_id, sender_id)
                     return
 
         question = content.strip()
@@ -466,12 +668,36 @@ def on_message(msg, chat):
 
     # ===== AI 生成回复 =====
     try:
+        if is_group and not (is_pat or is_image or is_video or is_emoji or is_quote):
+            identity_result = identity_memory.teach(ai,MODEL,chat_id,sender_id,content,at_ids,identity_members,group_profiles,self_id)
+            learning_result = (identity_result['message'] if identity_result else
+                               (None if identity_question else learned_preferences.teach(ai, MODEL, chat_id, sender_id, content)))
+        current_members = identity_members
+        if is_group and wx._db is not None:
+            try:
+                if current_members is None:
+                    current_members = wx._db.get_group_members(chat_id)
+            except Exception as exc:
+                print('群成员昵称读取暂不可用：', type(exc).__name__, flush=True)
+        style += learned_preferences.note(chat_id, members=current_members)
+        if not learning_result:
+            style += '\n程序本次没有保存、更新或删除长期记忆；如用户提出长期学习要求，不要声称已经保存成功。'
         if is_group and not is_pat:
+            if group_profiles.applies(chat_id):
+                style += group_profiles.context(chat_id, sender_id, content, at_ids, current_members, self_id)
+                if identity_question:
+                    style += ('\n本次身份问题的成员已确认，程序会在回复时真实@此人，正文自然回答，不要自行拼写@。'
+                              if identity_target else '\n本次名字匹配多个群成员，请简短请对方指明是群昵称还是微信昵称，不要猜测。')
+            else:
+                style += referenced_member_context(wx._db, chat_id, self_id, content, at_ids, respectful_contacts)
             mention_roster = build_mention_roster(wx._db,chat_id,sender_id,self_id,content,at_ids=at_ids,
                 recent_ids=group_engagement.recent_member_ids(chat_id),
-                allow_openers=not (is_quote or is_emoji or is_image or is_video))
+                allow_openers=not (is_quote or is_emoji or is_image or is_video),
+                group_aliases=group_profiles.group_aliases(chat_id))
             if mention_roster is not None:
                 style += mention_roster.note()
+        respect_style = respectful_contacts.style_for(sender_id)
+        style += respect_style
         if not is_pat:
             style += reply_identity.style_for(sender_id)
         if VOICE_ENABLED and not is_emoji:
@@ -479,7 +705,11 @@ def on_message(msg, chat):
             style += singing_note()
         if not is_pat:
             style += PAT_STYLE
-        if is_pat:
+        if learning_result:
+            answer = learning_result
+        elif identity_answer:
+            answer = '这是'+identity_answer+'。'
+        elif is_pat:
             answer = generate_pat_reply(ai, MODEL, style, previous, adaptive_voice=VOICE_ENABLED)
         else:
             user_text += quote_context(quote)
@@ -500,7 +730,7 @@ def on_message(msg, chat):
             if image_blocks:
                 print("已读取视频关键画面，结合对白分析" if video_context is not None else "已读取图片，发送给视觉模型分析", flush=True)
                 if is_emoji:
-                    answer = generate_sticker_reply(ai, MODEL, style, previous, user_text, images=image_blocks)
+                    answer = generate_sticker_reply(ai, MODEL, style, previous, user_text, images=image_blocks, respect_style=respect_style)
                     if not answer:
                         print('表情含义或回图未生成有效结果，本次跳过', flush=True)
                         return
@@ -514,12 +744,17 @@ def on_message(msg, chat):
         voice_hint = getattr(answer, 'voice_hint', None)
         web_image_path=getattr(answer,'web_image_path',None)
         answer, pat_suggested = extract_pat_intent(answer)
-        answer, boss_ack = reply_identity.prepare(answer,sender_id,requested=boss_ack_hint)
+        answer, boss_ack = reply_identity.prepare(answer,sender_id,requested=boss_ack_hint or bool(learning_result))
         mention_plan,mention_error = None,''
         if mention_roster is not None:
             answer,mention_plan,mention_error=mention_roster.parse(answer)
         else:
             answer=strip_mention_control(answer)
+        if identity_question:
+            mention_plan = MentionPlan(identity_target, 'requested', intro='就是这位。') if identity_target else None
+            mention_error = ''
+            if not identity_target:
+                answer = '这个昵称可能指两个人，你说的是群昵称还是微信昵称？'
         if mention_error:
             answer,voice_hint,pat_suggested=mention_error,None,False
             web_image_path=None
@@ -541,6 +776,10 @@ def on_message(msg, chat):
             answer, image_path = spoken_text(answer), None
         if boss_ack and not image_path and not singing_requested and not (mention_plan and voice_requested):
             answer = reply_identity.acknowledge(answer)
+        if not image_path and not singing_requested:
+            answer = respectful_contacts.address(answer, sender_id)
+            if is_group:
+                answer = group_profiles.address(chat_id, sender_id, answer)
         reply = answer
 
         print('表达方式：', '歌声原生语音' if singing_requested else ('原生语音' if voice_requested else '文字/图片'), '语气：', voice_plan.tone, flush=True)
@@ -548,62 +787,76 @@ def on_message(msg, chat):
 
         # ===== 自动发送 =====
         if AUTO_SEND:
-            # 只尝试一次，不自动重发
-            mention_media=bool(mention_plan and (voice_requested or singing_requested or image_path))
-            if mention_plan and not group_engagement.reserve_mention(chat_id,message_key,requested=mention_plan.mode=='requested'):
-                mention_plan,mention_media=None,False
-            if mention_plan and mention_media:
-                intro=reply_identity.acknowledge(mention_plan.intro) if boss_ack else mention_plan.intro
-                mention_result=send_group_mention(chat,intro,mention_plan.target_id,wx._db)
-                print('群聊@开场：',mention_result,flush=True)
-                if not delivery_succeeded(mention_result):
+            with group_delivery(chat_id, group_reply_token) as allowed:
+                if not allowed:
+                    print('群聊已静音或状态已改变，丢弃待发送回复', flush=True)
                     return
-                group_engagement.record_reply(chat_id,f'[向{mention_plan.target_name}发出@] '+intro)
-            if boss_ack and (singing_requested or image_path) and not mention_media:
-                # Media stays valid; acknowledge once before the requested
-                # image/song rather than inserting words into its control data.
-                ack_result=(send_group_reply(chat,'好的老板',sender_id,wx._db) if is_group else chat.SendMsg('好的老板'))
-                print('指令回应：',ack_result,flush=True)
-                if not delivery_succeeded(ack_result):
-                    return
-            if singing_requested:
-                result = send_singing_reply(chat, voice_plan.song, wx._db, self_id, profile=voice_plan.profile)
-                if result.get('status') == '未生成':
-                    # Generation failed before any native recording attempt. A
-                    # short notice is safe; never read the lyrics as a fallback.
-                    reply = answer = '这次没唱出来，换一首或者等会儿再试吧。'
+                # 只尝试一次，不自动重发
+                mention_media=bool(mention_plan and (voice_requested or singing_requested or image_path))
+                if mention_plan and not group_engagement.reserve_mention(chat_id,message_key,requested=mention_plan.mode=='requested'):
+                    mention_plan,mention_media=None,False
+                if mention_plan and mention_media:
+                    intro=reply_identity.acknowledge(mention_plan.intro) if boss_ack else mention_plan.intro
+                    if identity_question and identity_target:
+                        group_name=group_profiles.group_nickname_for(chat_id, identity_target)
+                        mention_result=(send_group_mention(chat,intro,mention_plan.target_id,wx._db,member_group_name=group_name)
+                                        if group_name else send_group_mention(chat,intro,mention_plan.target_id,wx._db))
+                    else:
+                        mention_result=send_group_mention(chat,intro,mention_plan.target_id,wx._db)
+                    print('群聊@开场：',mention_result,flush=True)
+                    if not delivery_succeeded(mention_result):
+                        return
+                    group_engagement.record_reply(chat_id,f'[向{mention_plan.target_name}发出@] '+intro)
+                if boss_ack and (singing_requested or image_path) and not mention_media:
+                    # Media stays valid; acknowledge once before the requested
+                    # image/song rather than inserting words into its control data.
+                    ack_result=(send_group_reply(chat,'好的老板',sender_id,wx._db) if is_group else chat.SendMsg('好的老板'))
+                    print('指令回应：',ack_result,flush=True)
+                    if not delivery_succeeded(ack_result):
+                        return
+                if singing_requested:
+                    result = send_singing_reply(chat, voice_plan.song, wx._db, self_id, profile=voice_plan.profile)
+                    if result.get('status') == '未生成':
+                        # Generation failed before any native recording attempt. A
+                        # short notice is safe; never read the lyrics as a fallback.
+                        reply = answer = '这次没唱出来，换一首或者等会儿再试吧。'
+                        result = send_group_reply(chat, reply, sender_id, wx._db) if is_group else chat.SendMsg(reply)
+                        from voice_director import VoicePlan
+                        voice_plan = VoicePlan(mode='text', gender=voice_plan.gender)
+                elif voice_requested:
+                    result = (send_native_voice(chat, reply, wx._db, self_id, profile=voice_plan.profile) if VOICE_ENABLED
+                              else {'status': '失败', 'message': '原生语音发送已关闭，未改发音频文件', 'data': None})
+                elif image_path:
+                    result = send_image_reply(chat, image_path)
+                elif mention_plan and not mention_media:
+                    if identity_question and identity_target:
+                        group_name = group_profiles.group_nickname_for(chat_id, identity_target)
+                        result = (send_group_mention(chat,reply,mention_plan.target_id,wx._db,member_group_name=group_name)
+                                  if group_name else send_group_mention(chat,reply,mention_plan.target_id,wx._db))
+                    else:
+                        result = send_group_mention(chat,reply,mention_plan.target_id,wx._db)
+                else:
                     result = send_group_reply(chat, reply, sender_id, wx._db) if is_group else chat.SendMsg(reply)
-                    from voice_director import VoicePlan
-                    voice_plan = VoicePlan(mode='text', gender=voice_plan.gender)
-            elif voice_requested:
-                result = (send_native_voice(chat, reply, wx._db, self_id, profile=voice_plan.profile) if VOICE_ENABLED
-                          else {'status': '失败', 'message': '原生语音发送已关闭，未改发音频文件', 'data': None})
-            elif image_path:
-                result = send_image_reply(chat, image_path)
-            elif mention_plan and not mention_media:
-                result = send_group_mention(chat,reply,mention_plan.target_id,wx._db)
-            else:
-                result = send_group_reply(chat, reply, sender_id, wx._db) if is_group else chat.SendMsg(reply)
-            print(
-                "微信发送操作返回：",
-                result,
-                flush=True
-            )
-            print(
-                "请核对微信中的实际发送结果",
-                flush=True
-            )
-            if is_group and delivery_succeeded(result):
-                context_answer=(f'[向{mention_plan.target_name}发出@] '+answer if mention_plan and not mention_media else answer)
-                group_engagement.record_reply(chat_id, context_answer)
-            if delivery_succeeded(result):
-                voice_director.record(history_key, voice_plan)
-            if not mention_plan and not voice_requested and not singing_requested and delivery_succeeded(result) and proactive_pats.choose(chat_id, sender_id, content, message_key,
-                                                                    suggested=pat_suggested, received_pat=is_pat):
-                pat_result = send_native_pat(chat, msg, sender_id, wx._db, self_id)
-                print('主动拍一拍结果：', pat_result, flush=True)
-                if is_group and delivery_succeeded(pat_result):
-                    group_engagement.record_pat(chat_id, sender_id)
+                print(
+                    "微信发送操作返回：",
+                    result,
+                    flush=True
+                )
+                print(
+                    "请核对微信中的实际发送结果",
+                    flush=True
+                )
+                if is_group and delivery_succeeded(result):
+                    context_answer=(f'[向{mention_plan.target_name}发出@] '+answer if mention_plan and not mention_media else answer)
+                    group_engagement.record_reply(chat_id, context_answer, reply_to=sender_id)
+                if delivery_succeeded(result):
+                    voice_director.record(history_key, voice_plan)
+                if not mention_plan and not voice_requested and not singing_requested and delivery_succeeded(result) and proactive_pats.choose(chat_id, sender_id, content, message_key,
+                                                                        suggested=pat_suggested, received_pat=is_pat):
+                    pat_result = send_native_pat(chat, msg, sender_id, wx._db, self_id)
+                    print('主动拍一拍结果：', pat_result, flush=True)
+                    if is_group and delivery_succeeded(pat_result):
+                        group_engagement.record_pat(chat_id, sender_id)
         else:
             print(
                 "预览模式：未发送",
@@ -635,8 +888,29 @@ result = wx.AddListenAll(on_message)
 if not result:
     raise RuntimeError(f"全局监听失败：{result}")
 
+def remember_scheduled_greeting(config):
+    chat_id, member_id = config['group_id'], config['member_id']
+    text = config['text']
+    group_engagement.record_reply(chat_id, '[向群成员发出@] ' + text)
+    with lock:
+        history_key = (chat_id, member_id)
+        group_followups.pop(history_key, None)
+        group_followups[history_key] = None
+        histories[history_key].append({'role':'assistant', 'content':text})
+        if len(group_followups) > 2000:
+            oldest = next(iter(group_followups))
+            group_followups.pop(oldest, None)
+            histories.pop(oldest, None)
+
+from scheduled_greeting import start as start_scheduled_greeting
+start_scheduled_greeting(wx, AUTO_SEND, on_sent=remember_scheduled_greeting, send_guard=group_delivery)
+from scheduled_morning import start as start_morning_greeting
+start_morning_greeting(wx, AUTO_SEND, on_sent=remember_scheduled_greeting, send_guard=group_delivery)
+
 print("========================", flush=True)
 print("微信 AI 智能助手已启动", flush=True)
+print("工作助手 v2：已加载；仅绑定老板私聊；支持连续任务、Word/Excel、文件交付", flush=True)
+print("token用量：按北京时间累计API返回用量；所有人可自然询问今日用量或/token",flush=True)
 print("联网搜索：按需开启，回复不含链接", flush=True)
 print("图片搜索：按请求搜索真实公开图片，取得并检查文件后发送图片",flush=True)
 print("聊天风格：随对话氛围变化；支持emoji与静态表情包", flush=True)
@@ -654,6 +928,7 @@ print("群聊参与：开放提问或吐槽时偶尔接话；其他成员明显�
 print("昵称自动跟随微信改名，收到群消息时每10秒刷新", flush=True)
 print("群聊@：可选择本群成员；明确要求提醒或自然邀请开话题时使用真实@，普通回复不@", flush=True)
 print("一分钟无人接话：已关闭，不因无人回复主动发言", flush=True)
+print("老板群聊静音：闭嘴/不要再讲话→收到后整群静音；可以说话了/恢复说话→解除",flush=True)
 print("私聊模式：", PRIVATE_MODE, flush=True)
 print("允许的群聊：", GROUPS, flush=True)
 print(

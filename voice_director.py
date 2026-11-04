@@ -59,7 +59,7 @@ def parse_direction(raw):
     """Only accept leading structured metadata; never expose a broken tag."""
     raw = str(raw or '')
     hint = None
-    match = re.match(r'^\s*\[\[声音:(\{.*?\})\]\]\s*', raw, flags=re.S)
+    match = re.match(r'^\s*\[{1,2}声音[:：]\s*(\{.*?\})\]{1,2}\s*', raw, flags=re.S)
     if match:
         try:
             value = json.loads(match[1])
@@ -89,7 +89,7 @@ def parse_direction(raw):
         except (ValueError, TypeError):
             raw = ''  # A truncated internal object is not a chat response.
     # Strip tags even if malformed, repeated, placed after the body, or truncated.
-    raw = re.sub(r'\[\[声音:.*?(?:\]\]|$)', '', raw, flags=re.S)
+    raw = re.sub(r'\[{1,2}声音[:：].*?(?:\]{1,2}|$)', '', raw, flags=re.S)
     return DirectedReply(raw.strip(), hint)
 
 

@@ -130,7 +130,7 @@ def _restore_chat_tree(gui, uia, target):
     return None, None, None
 
 
-def _ready_input(chat, gui):
+def _ready_input_once(chat, gui):
     """Use the existing chat when its title matches; no blind cached coordinates."""
     if not gui.ensure_visible():
         return None, None
@@ -178,6 +178,29 @@ def _ready_input(chat, gui):
             return uia, control
         print('已确认目标会话，但微信尚未提供发送输入框', flush=True)
     # Let the standard text sender handle unavailable UIA without repeating navigation.
+    return None, None
+
+
+def _ready_input(chat, gui):
+    """Recover a stale UIA tree once before composing or submitting anything."""
+    for attempt in range(2):
+        try:
+            uia, control = _ready_input_once(chat, gui)
+            if control is not None:
+                return uia, control
+        except Exception as exc:
+            print('微信输入框检查暂时失败：', type(exc).__name__, flush=True)
+        if attempt == 0:
+            # Only invalidate and reacquire UIA before any text is written.
+            # The next pass still checks the exact chat and input control.
+            try:
+                gui._uia = None
+                gui._uia_tried = False
+                gui._uia_check_ts = 0.0
+                gui._last_input_box = None
+            except Exception:
+                pass
+            time.sleep(0.3)
     return None, None
 
 
@@ -363,7 +386,7 @@ def send_group_reply(chat, text, sender_id, db, *, start_topic=False):
     return send()
 
 
-def send_group_mention(chat,text,target_id,db):
+def send_group_mention(chat,text,target_id,db,*,member_group_name=None):
     """Strict native mention of a selected current member; never fake success."""
     chat_id=str(getattr(chat,'who','') or '')
     if not chat_id.endswith('@chatroom'):
@@ -371,6 +394,11 @@ def send_group_mention(chat,text,target_id,db):
     name=resolve_member_name(db,chat_id,target_id)
     if not name:
         return _failure('目标成员已离群、名称重名或无法唯一确认，未发送@')
+    if member_group_name is not None:
+        candidate=str(member_group_name).strip()
+        if not candidate or len(candidate)>80 or _norm(candidate) in ('所有人','all','notify@all'):
+            return _failure('群昵称无效，未发送@')
+        name=candidate
     from wechatauto.utils import LockManager
     with LockManager.acquire():
         actual=getattr(chat,'chat',None) or chat
